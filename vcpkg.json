@@ -1,0 +1,9 @@
+{
+  "name": "sindarin-template",
+  "version": "0.1.0",
+  "description": "A Handlebars-compatible templating engine written in C",
+  "license": "MIT",
+  "dependencies": [
+    "json-c"
+  ]
+}
