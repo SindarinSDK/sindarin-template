@@ -20,8 +20,13 @@ typedef struct hbs_options {
     json_object *context;       /* Current context */
     json_object **params;       /* Resolved positional parameters */
     int param_count;
-    char *(*fn)(json_object *ctx);       /* Render block content with context */
-    char *(*inverse)(json_object *ctx);  /* Render else block with context */
+    const char *name;           /* Name of the helper being invoked */
+    char **block_params;        /* Block parameter names (as |x y|), or NULL */
+    int block_param_count;
+    char *(*fn)(json_object *ctx, void *data);      /* Render block content with context */
+    char *(*inverse)(json_object *ctx, void *data); /* Render else block with context */
+    void *fn_data;              /* Internal: closure data for fn (do not use) */
+    void *inverse_data;         /* Internal: closure data for inverse (do not use) */
     void *_internal;            /* Internal render state (do not use) */
 } hbs_options_t;
 
@@ -42,6 +47,11 @@ typedef enum {
 
 hbs_env_t *hbs_env_create(void);
 void hbs_env_destroy(hbs_env_t *env);
+
+/* Environment options */
+void hbs_env_set_no_escape(hbs_env_t *env, bool enabled);   /* Disable HTML escaping globally */
+void hbs_env_set_compat(hbs_env_t *env, bool enabled);      /* Recursive field lookup */
+void hbs_env_set_strict(hbs_env_t *env, bool enabled);      /* Error on missing variables */
 
 /* Register a custom helper */
 hbs_error_t hbs_register_helper(hbs_env_t *env, const char *name, hbs_helper_fn fn);
@@ -64,7 +74,17 @@ void hbs_template_destroy(hbs_template_t *tmpl);
 
 char *hbs_render(hbs_template_t *tmpl, json_object *context, hbs_error_t *err);
 
+/* Get the error detail message from the last failed render.
+ * Returns a pointer to the template's internal error buffer (valid until next render).
+ * Returns NULL if no error occurred. */
+const char *hbs_render_error_message(hbs_template_t *tmpl);
+
 /* ---- Utilities ---- */
+
+/* Create a new private data frame (shallow copy of options->data).
+ * For use in custom helpers that need to set private data variables.
+ * Caller must json_object_put() the returned object when done. */
+json_object *hbs_create_frame(hbs_options_t *options);
 
 /* HTML-escape a string (caller must free result) */
 char *hbs_escape_html(const char *input);

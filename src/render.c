@@ -20,12 +20,17 @@ struct hbs_env {
         char *source;
     } *partials;
     int partial_count;
+
+    bool no_escape;     /* Disable HTML escaping for all {{expr}} */
+    bool compat;        /* Enable recursive field lookup (compat mode) */
+    bool strict;        /* Error on missing variables */
 };
 
 /* Template struct */
 struct hbs_template {
     hbs_ast_node_t *ast;
     hbs_env_t *env;
+    char last_error[256];       /* Error detail from last render */
 };
 
 /* ---- Context frame management ---- */
@@ -162,13 +167,43 @@ static json_object *resolve_path(hbs_render_state_t *state, hbs_path_t *path) {
 
     /* Resolve path parts against context */
     json_object *cur = frame->data;
+    bool resolve_failed = false;
     for (int i = 0; i < path->part_count; i++) {
         if (!cur || !json_object_is_type(cur, json_type_object)) {
-            return NULL;
+            cur = NULL;
+            resolve_failed = true;
+            break;
         }
         json_object *next = NULL;
         json_object_object_get_ex(cur, path->parts[i], &next);
         cur = next;
+    }
+
+    /* Compat mode: if the path was not resolved and path has no explicit depth,
+     * walk up parent frames looking for the field (recursive field lookup) */
+    if ((resolve_failed || !cur) && state->env && state->env->compat &&
+        path->depth == 0 && path->part_count > 0) {
+        hbs_context_frame_t *search = frame->parent;
+        while (search) {
+            if (search->data && json_object_is_type(search->data, json_type_object)) {
+                json_object *found = NULL;
+                json_object_object_get_ex(search->data, path->parts[0], &found);
+                if (found) {
+                    /* Resolve remaining segments */
+                    for (int i = 1; i < path->part_count; i++) {
+                        if (!found || !json_object_is_type(found, json_type_object)) {
+                            found = NULL;
+                            break;
+                        }
+                        json_object *next = NULL;
+                        json_object_object_get_ex(found, path->parts[i], &next);
+                        found = next;
+                    }
+                    if (found) return found;
+                }
+            }
+            search = search->parent;
+        }
     }
 
     return cur;
@@ -623,7 +658,8 @@ static void render_builtin_lookup(hbs_render_state_t *state, hbs_ast_node_t *nod
 
     if (result) {
         const char *str = json_value_to_string(result);
-        if (escaped) {
+        bool should_escape = escaped && !(state->env && state->env->no_escape);
+        if (should_escape) {
             char *esc = hbs_html_escape(str);
             hbs_strbuf_append(&state->output, esc);
             free(esc);
@@ -664,22 +700,30 @@ typedef struct {
     hbs_ast_node_t *body;
 } _helper_block_ctx_t;
 
-static _helper_block_ctx_t _fn_ctx;
-static _helper_block_ctx_t _inverse_ctx;
-
-static char *_helper_fn_callback(json_object *ctx) {
-    return render_program_to_string(_fn_ctx.state, _fn_ctx.body, ctx);
+static char *_helper_fn_callback(json_object *ctx, void *data) {
+    _helper_block_ctx_t *bctx = (_helper_block_ctx_t *)data;
+    return render_program_to_string(bctx->state, bctx->body, ctx);
 }
 
-static char *_helper_inverse_callback(json_object *ctx) {
-    return render_program_to_string(_inverse_ctx.state, _inverse_ctx.body, ctx);
+static char *_helper_inverse_callback(json_object *ctx, void *data) {
+    _helper_block_ctx_t *bctx = (_helper_block_ctx_t *)data;
+    return render_program_to_string(bctx->state, bctx->body, ctx);
+}
+
+/* Callback for raw block helpers: returns the raw content string */
+typedef struct { char *content; } _raw_block_ctx_t;
+
+static char *_raw_block_fn_callback(json_object *ctx, void *data) {
+    _raw_block_ctx_t *rctx = (_raw_block_ctx_t *)data;
+    return rctx->content ? strdup(rctx->content) : strdup("");
 }
 
 static void render_custom_helper(hbs_render_state_t *state, const char *name,
                                   hbs_helper_fn helper_fn,
                                   hbs_ast_node_t **param_nodes, int param_count,
                                   hbs_hash_pair_t *hash_pairs, int hash_count,
-                                  hbs_ast_node_t *body, hbs_ast_node_t *inverse) {
+                                  hbs_ast_node_t *body, hbs_ast_node_t *inverse,
+                                  char **block_params, int block_param_count) {
     /* Resolve params */
     json_object **params = NULL;
     bool *param_owned = NULL;
@@ -698,6 +742,9 @@ static void render_custom_helper(hbs_render_state_t *state, const char *name,
     opts.context = state->frame->data;
     opts.params = params;
     opts.param_count = param_count;
+    opts.name = name;
+    opts.block_params = block_params;
+    opts.block_param_count = block_param_count;
     opts._internal = state;
 
     /* Build hash */
@@ -711,16 +758,20 @@ static void render_custom_helper(hbs_render_state_t *state, const char *name,
         }
     }
 
-    /* Set up fn/inverse callbacks */
+    /* Set up fn/inverse callbacks (stack-allocated, thread-safe) */
+    _helper_block_ctx_t fn_closure = {0};
+    _helper_block_ctx_t inverse_closure = {0};
     if (body) {
-        _fn_ctx.state = state;
-        _fn_ctx.body = body;
+        fn_closure.state = state;
+        fn_closure.body = body;
         opts.fn = _helper_fn_callback;
+        opts.fn_data = &fn_closure;
     }
     if (inverse) {
-        _inverse_ctx.state = state;
-        _inverse_ctx.body = inverse;
+        inverse_closure.state = state;
+        inverse_closure.body = inverse;
         opts.inverse = _helper_inverse_callback;
+        opts.inverse_data = &inverse_closure;
     }
 
     /* Private data */
@@ -938,6 +989,7 @@ static void render_program(hbs_render_state_t *state, hbs_ast_node_t *program) {
     if (!program || program->type != HBS_AST_PROGRAM) return;
 
     for (int i = 0; i < program->program.statement_count; i++) {
+        if (state->has_error) return;
         hbs_ast_node_t *stmt = program->program.statements[i];
 
         /* Apply whitespace stripping from previous mustache/block */
@@ -983,7 +1035,7 @@ static void render_program(hbs_render_state_t *state, hbs_ast_node_t *program) {
 }
 
 static void render_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
-    if (!node) return;
+    if (!node || state->has_error) return;
 
     switch (node->type) {
         case HBS_AST_PROGRAM:
@@ -1015,7 +1067,7 @@ static void render_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
                     render_custom_helper(state, name, hfn,
                         node->mustache.params, node->mustache.param_count,
                         node->mustache.hash_pairs, node->mustache.hash_count,
-                        NULL, NULL);
+                        NULL, NULL, NULL, 0);
                     break;
                 }
 
@@ -1026,7 +1078,7 @@ static void render_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
                         render_custom_helper(state, name, missing,
                             node->mustache.params, node->mustache.param_count,
                             node->mustache.hash_pairs, node->mustache.hash_count,
-                            NULL, NULL);
+                            NULL, NULL, NULL, 0);
                         break;
                     }
                 }
@@ -1034,9 +1086,30 @@ static void render_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
 
             /* Simple expression: resolve path and output */
             json_object *val = resolve_path(state, node->mustache.path);
+            if (!val && state->env && state->env->strict && node->mustache.path) {
+                /* Build path string for error message */
+                hbs_strbuf_t pathbuf;
+                hbs_strbuf_init(&pathbuf);
+                for (int pi = 0; pi < node->mustache.path->depth; pi++) {
+                    hbs_strbuf_append(&pathbuf, "../");
+                }
+                for (int pi = 0; pi < node->mustache.path->part_count; pi++) {
+                    if (pi > 0) hbs_strbuf_append_char(&pathbuf, '.');
+                    hbs_strbuf_append(&pathbuf, node->mustache.path->parts[pi]);
+                }
+                snprintf(state->error_msg, sizeof(state->error_msg),
+                    "\"%s\" not defined in %s",
+                    pathbuf.data ? pathbuf.data : "",
+                    node->mustache.path->depth > 0 ? "parent context" : "current context");
+                hbs_strbuf_free(&pathbuf);
+                state->has_error = true;
+                break;
+            }
             if (val) {
                 const char *str = json_value_to_string(val);
-                if (node->mustache.escaped) {
+                bool should_escape = node->mustache.escaped &&
+                    !(state->env && state->env->no_escape);
+                if (should_escape) {
                     char *escaped = hbs_html_escape(str);
                     hbs_strbuf_append(&state->output, escaped);
                     free(escaped);
@@ -1073,7 +1146,8 @@ static void render_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
                     render_custom_helper(state, name, hfn,
                         node->block.params, node->block.param_count,
                         node->block.hash_pairs, node->block.hash_count,
-                        node->block.body, node->block.inverse);
+                        node->block.body, node->block.inverse,
+                        node->block.block_params, node->block.block_param_count);
                 } else {
                     /* blockHelperMissing hook */
                     hbs_helper_fn missing = find_helper(state->env, "blockHelperMissing");
@@ -1081,7 +1155,8 @@ static void render_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
                         render_custom_helper(state, name, missing,
                             node->block.params, node->block.param_count,
                             node->block.hash_pairs, node->block.hash_count,
-                            node->block.body, node->block.inverse);
+                            node->block.body, node->block.inverse,
+                            node->block.block_params, node->block.block_param_count);
                     } else {
                         /* Unknown block helper — render body in current context */
                         render_program(state, node->block.body);
@@ -1098,11 +1173,32 @@ static void render_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
         case HBS_AST_COMMENT:
             break;
 
-        case HBS_AST_RAW_BLOCK:
-            if (node->raw_block.content) {
+        case HBS_AST_RAW_BLOCK: {
+            const char *rname = node->raw_block.helper_name;
+            hbs_helper_fn raw_hfn = rname ? find_helper(state->env, rname) : NULL;
+            if (raw_hfn) {
+                /* Custom raw block helper: fn() returns the raw content */
+                hbs_options_t opts = {0};
+                opts.context = state->frame->data;
+                opts.name = rname;
+                opts._internal = state;
+
+                _raw_block_ctx_t rctx = {
+                    .content = node->raw_block.content ? node->raw_block.content : ""
+                };
+                opts.fn = _raw_block_fn_callback;
+                opts.fn_data = &rctx;
+
+                char *result = raw_hfn(NULL, 0, &opts);
+                if (result) {
+                    hbs_strbuf_append(&state->output, result);
+                    free(result);
+                }
+            } else if (node->raw_block.content) {
                 hbs_strbuf_append(&state->output, node->raw_block.content);
             }
             break;
+        }
 
         case HBS_AST_INLINE_PARTIAL: {
             /* Register inline partial in current frame */
@@ -1427,6 +1523,18 @@ hbs_env_t *hbs_env_create(void) {
     return calloc(1, sizeof(hbs_env_t));
 }
 
+void hbs_env_set_no_escape(hbs_env_t *env, bool enabled) {
+    if (env) env->no_escape = enabled;
+}
+
+void hbs_env_set_compat(hbs_env_t *env, bool enabled) {
+    if (env) env->compat = enabled;
+}
+
+void hbs_env_set_strict(hbs_env_t *env, bool enabled) {
+    if (env) env->strict = enabled;
+}
+
 void hbs_env_destroy(hbs_env_t *env) {
     if (!env) return;
     for (int i = 0; i < env->helper_count; i++) {
@@ -1553,8 +1661,31 @@ char *hbs_render(hbs_template_t *tmpl, json_object *context, hbs_error_t *err) {
 
     render_program(&state, tmpl->ast);
 
+    if (state.has_error) {
+        if (err) *err = HBS_ERR_RENDER;
+        memcpy(tmpl->last_error, state.error_msg, sizeof(tmpl->last_error));
+        hbs_strbuf_free(&state.output);
+        return NULL;
+    }
+
+    tmpl->last_error[0] = '\0';
     if (err) *err = HBS_OK;
     return hbs_strbuf_detach(&state.output);
+}
+
+const char *hbs_render_error_message(hbs_template_t *tmpl) {
+    if (!tmpl || tmpl->last_error[0] == '\0') return NULL;
+    return tmpl->last_error;
+}
+
+json_object *hbs_create_frame(hbs_options_t *options) {
+    json_object *frame = json_object_new_object();
+    if (options && options->data && json_object_is_type(options->data, json_type_object)) {
+        json_object_object_foreach(options->data, key, val) {
+            json_object_object_add(frame, key, val ? json_object_get(val) : NULL);
+        }
+    }
+    return frame;
 }
 
 char *hbs_escape_html(const char *input) {

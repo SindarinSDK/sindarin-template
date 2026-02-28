@@ -16,7 +16,7 @@ static char *helper_bold(json_object **params, int param_count, hbs_options_t *o
 /* Custom block helper: noop (renders body unchanged) */
 static char *helper_noop(json_object **params, int param_count, hbs_options_t *options) {
     if (options->fn) {
-        return options->fn(options->context);
+        return options->fn(options->context, options->fn_data);
     }
     return strdup("");
 }
@@ -37,7 +37,7 @@ static char *helper_list(json_object **params, int param_count, hbs_options_t *o
     for (int i = 0; i < len; i++) {
         json_object *item = json_object_array_get_idx(items, i);
         if (options->fn) {
-            char *rendered = options->fn(item);
+            char *rendered = options->fn(item, options->fn_data);
             if (rendered) {
                 size_t rlen = strlen(rendered);
                 while (pos + rlen + 10 >= buf_size) {
@@ -63,6 +63,44 @@ static char *helper_list(json_object **params, int param_count, hbs_options_t *o
     return buf;
 }
 
+/* Helper that returns its own name via options->name */
+static char *helper_echo_name(json_object **params, int param_count, hbs_options_t *options) {
+    return options->name ? strdup(options->name) : strdup("(null)");
+}
+
+/* Block helper that reports block param names */
+static char *helper_report_block_params(json_object **params, int param_count, hbs_options_t *options) {
+    if (options->block_param_count > 0) {
+        size_t len = 0;
+        for (int i = 0; i < options->block_param_count; i++) {
+            len += strlen(options->block_params[i]) + 1;
+        }
+        char *result = malloc(len);
+        result[0] = '\0';
+        for (int i = 0; i < options->block_param_count; i++) {
+            if (i > 0) strcat(result, ",");
+            strcat(result, options->block_params[i]);
+        }
+        return result;
+    }
+    return strdup("none");
+}
+
+/* Raw block helper that wraps content in <pre> tags */
+static char *helper_raw_wrap(json_object **params, int param_count, hbs_options_t *options) {
+    if (options->fn) {
+        char *content = options->fn(options->context, options->fn_data);
+        if (content) {
+            size_t len = strlen(content) + 12;
+            char *result = malloc(len);
+            snprintf(result, len, "<pre>%s</pre>", content);
+            free(content);
+            return result;
+        }
+    }
+    return strdup("<pre></pre>");
+}
+
 /* helperMissing hook: returns a placeholder string */
 static char *helper_missing(json_object **params, int param_count, hbs_options_t *options) {
     return strdup("MISSING");
@@ -71,7 +109,7 @@ static char *helper_missing(json_object **params, int param_count, hbs_options_t
 /* blockHelperMissing hook: renders inverse block */
 static char *block_helper_missing(json_object **params, int param_count, hbs_options_t *options) {
     if (options->inverse) {
-        return options->inverse(options->context);
+        return options->inverse(options->context, options->inverse_data);
     }
     return strdup("BLOCK_MISSING");
 }
@@ -429,6 +467,142 @@ void test_helpers(void) {
 
         result = render_template(env2, "{{bold name}}", ctx);
         ASSERT_STR_EQ("", result, "helper gone after unregister");
+        free(result);
+
+        json_object_put(ctx);
+        hbs_env_destroy(env2);
+    }
+
+    /* options.name — inline helper */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_register_helper(env2, "myHelper", helper_echo_name);
+
+        char *result = render_template(env2, "{{myHelper}}", NULL);
+        ASSERT_STR_EQ("myHelper", result, "options.name is set for inline helper");
+        free(result);
+        hbs_env_destroy(env2);
+    }
+
+    /* options.name — block helper */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_register_helper(env2, "myBlock", helper_echo_name);
+
+        char *result = render_template(env2, "{{#myBlock}}body{{/myBlock}}", NULL);
+        ASSERT_STR_EQ("myBlock", result, "options.name is set for block helper");
+        free(result);
+        hbs_env_destroy(env2);
+    }
+
+    /* options.blockParams — block helper with as |x y| */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_register_helper(env2, "reportParams", helper_report_block_params);
+
+        char *result = render_template(env2,
+            "{{#reportParams as |item idx|}}body{{/reportParams}}", NULL);
+        ASSERT_STR_EQ("item,idx", result, "options.blockParams receives block param names");
+        free(result);
+        hbs_env_destroy(env2);
+    }
+
+    /* options.blockParams — no block params */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_register_helper(env2, "reportParams", helper_report_block_params);
+
+        char *result = render_template(env2,
+            "{{#reportParams}}body{{/reportParams}}", NULL);
+        ASSERT_STR_EQ("none", result, "options.blockParams is empty when no block params");
+        free(result);
+        hbs_env_destroy(env2);
+    }
+
+    /* hbs_create_frame */
+    {
+        hbs_options_t opts = {0};
+        json_object *data = json_object_new_object();
+        json_object_object_add(data, "index", json_object_new_int(5));
+        json_object_object_add(data, "key", json_object_new_string("hello"));
+        opts.data = data;
+
+        json_object *frame = hbs_create_frame(&opts);
+        ASSERT_NOT_NULL(frame, "hbs_create_frame returns non-null");
+
+        json_object *idx = NULL;
+        json_object_object_get_ex(frame, "index", &idx);
+        ASSERT_STR_EQ("5", json_object_get_string(idx), "createFrame copies index");
+
+        json_object *key = NULL;
+        json_object_object_get_ex(frame, "key", &key);
+        ASSERT_STR_EQ("hello", json_object_get_string(key), "createFrame copies key");
+
+        json_object_put(frame);
+        json_object_put(data);
+    }
+
+    /* Custom raw block helper */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_register_helper(env2, "rawWrap", helper_raw_wrap);
+
+        char *result = render_template(env2,
+            "{{{{rawWrap}}}}{{not-processed}}{{{{/rawWrap}}}}", NULL);
+        ASSERT_STR_EQ("<pre>{{not-processed}}</pre>", result,
+            "custom raw block helper wraps raw content");
+        free(result);
+        hbs_env_destroy(env2);
+    }
+
+    /* Raw block without registered helper still outputs literally */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+
+        char *result = render_template(env2,
+            "{{{{raw}}}}{{literal}}{{{{/raw}}}}", NULL);
+        ASSERT_STR_EQ("{{literal}}", result,
+            "raw block without helper outputs content literally");
+        free(result);
+        hbs_env_destroy(env2);
+    }
+
+    /* Strict mode: missing variable returns error */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_env_set_strict(env2, true);
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "exists", json_object_new_string("yes"));
+
+        hbs_error_t err;
+        hbs_template_t *tmpl = hbs_compile(env2, "{{exists}}", &err);
+        char *result = hbs_render(tmpl, ctx, &err);
+        ASSERT_STR_EQ("yes", result, "strict mode: existing var renders normally");
+        free(result);
+        hbs_template_destroy(tmpl);
+
+        tmpl = hbs_compile(env2, "{{missing}}", &err);
+        result = hbs_render(tmpl, ctx, &err);
+        ASSERT_NULL(result, "strict mode: missing var returns NULL");
+        ASSERT_STR_EQ("Render error", hbs_error_string(err), "strict mode: err is HBS_ERR_RENDER");
+
+        const char *detail = hbs_render_error_message(tmpl);
+        ASSERT_NOT_NULL(detail, "strict mode: error message is available");
+        hbs_template_destroy(tmpl);
+
+        json_object_put(ctx);
+        hbs_env_destroy(env2);
+    }
+
+    /* Strict mode off: missing variable is empty string (default) */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+
+        json_object *ctx = json_object_new_object();
+
+        char *result = render_template(env2, "A{{missing}}B", ctx);
+        ASSERT_STR_EQ("AB", result, "non-strict mode: missing var is empty string");
         free(result);
 
         json_object_put(ctx);

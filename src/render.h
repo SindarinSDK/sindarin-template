@@ -35,6 +35,8 @@ typedef struct {
     hbs_env_t *env;
     hbs_context_frame_t *frame;         /* Top of context stack */
     hbs_strbuf_t output;
+    bool has_error;                     /* Set when strict mode encounters missing var */
+    char error_msg[256];                /* Error message buffer */
 } hbs_render_state_t;
 
 /* Render an AST into a string (caller must free result) */

@@ -145,4 +145,64 @@ void test_expressions(void) {
     }
 
     hbs_env_destroy(env);
+
+    /* Compat mode: recursive field lookup in nested context */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_env_set_compat(env2, true);
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "greeting", json_object_new_string("Hello"));
+        json_object *person = json_object_new_object();
+        json_object_object_add(person, "name", json_object_new_string("World"));
+        json_object_object_add(ctx, "person", person);
+
+        char *result = render_template(env2,
+            "{{#with person}}{{greeting}} {{name}}{{/with}}", ctx);
+        ASSERT_STR_EQ("Hello World", result,
+            "compat mode: finds 'greeting' in parent context");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env2);
+    }
+
+    /* Compat mode off: parent field not found without ../ */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "greeting", json_object_new_string("Hello"));
+        json_object *person = json_object_new_object();
+        json_object_object_add(person, "name", json_object_new_string("World"));
+        json_object_object_add(ctx, "person", person);
+
+        char *result = render_template(env2,
+            "{{#with person}}{{greeting}} {{name}}{{/with}}", ctx);
+        ASSERT_STR_EQ(" World", result,
+            "non-compat: 'greeting' not found without ../");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env2);
+    }
+
+    /* Compat mode: recursive lookup in each loop */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_env_set_compat(env2, true);
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "separator", json_object_new_string("-"));
+        json_object *items = json_object_new_array();
+        json_object_array_add(items, json_object_new_string("a"));
+        json_object_array_add(items, json_object_new_string("b"));
+        json_object_object_add(ctx, "items", items);
+
+        char *result = render_template(env2,
+            "{{#each items}}{{this}}{{separator}}{{/each}}", ctx);
+        ASSERT_STR_EQ("a-b-", result,
+            "compat mode: finds 'separator' from parent in each loop");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env2);
+    }
 }

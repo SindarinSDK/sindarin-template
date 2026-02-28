@@ -7,8 +7,10 @@ A Handlebars-compatible template engine written in C11. Parses, compiles, and re
 - Full Handlebars expression syntax (`{{expr}}`, `{{{unescaped}}}`, `{{&unescaped}}`)
 - Built-in helpers: `if`, `unless`, `each`, `with`, `lookup`, `log`
 - Chained `{{else if}}` / `{{else unless}}` / `{{else each}}` / `{{else with}}`
-- Custom inline and block helpers with `fn()` / `inverse()` callbacks
+- Custom inline and block helpers with thread-safe `fn()` / `inverse()` callbacks
+- Custom raw block helpers (`{{{{name}}}}...{{{{/name}}}}`)
 - `helperMissing` / `blockHelperMissing` hooks
+- `options.name`, `options.blockParams`, `hbs_create_frame()` for helper introspection
 - Partials: static, dynamic, inline, nested, with context and hash parameters
 - Partial blocks (`{{#> layout}}fallback{{/layout}}`) with `{{> @partial-block}}` yielding
 - Standalone whitespace stripping for blocks, comments, and partials
@@ -18,6 +20,7 @@ A Handlebars-compatible template engine written in C11. Parses, compiles, and re
 - Private data variables: `@index`, `@key`, `@first`, `@last`
 - Subexpressions: `{{> (lookup . "name")}}`
 - Raw blocks: `{{{{raw}}}}...{{{{/raw}}}}`
+- Strict mode, compat mode (recursive field lookup), noEscape option
 - Whitespace control: `{{~expr~}}`
 - HTML escaping of `& < > " ' = \``
 - Escaped mustaches: `\{{literal}}`
@@ -89,6 +92,18 @@ void hbs_env_destroy(hbs_env_t *env);
 
 Creates and destroys an environment that holds registered helpers and partials. All templates compiled with an environment share its helpers and partials.
 
+#### Environment Options
+
+```c
+void hbs_env_set_no_escape(hbs_env_t *env, bool enabled);  // Disable HTML escaping globally
+void hbs_env_set_compat(hbs_env_t *env, bool enabled);     // Enable recursive field lookup
+void hbs_env_set_strict(hbs_env_t *env, bool enabled);     // Error on missing variables
+```
+
+- **noEscape**: When enabled, `{{expr}}` behaves like `{{{expr}}}` — no HTML escaping.
+- **compat**: When enabled, path resolution walks up parent contexts when a field is not found on the current context (Handlebars.js compatibility mode).
+- **strict**: When enabled, referencing a missing variable in `{{expr}}` causes `hbs_render()` to return `NULL` with `HBS_ERR_RENDER`. Use `hbs_render_error_message()` to get the detail message.
+
 ### Template Compilation
 
 ```c
@@ -106,6 +121,12 @@ char *hbs_render(hbs_template_t *tmpl, json_object *context, hbs_error_t *err);
 
 Renders a compiled template with the given JSON context. Returns a `malloc`-allocated string that the caller must `free()`. Returns `NULL` on error.
 
+```c
+const char *hbs_render_error_message(hbs_template_t *tmpl);
+```
+
+Returns the error detail message from the last failed render (e.g., strict mode violations). Returns `NULL` if the last render succeeded.
+
 ### Helpers
 
 ```c
@@ -119,14 +140,19 @@ Register or unregister custom helpers. Helper functions receive resolved paramet
 
 ```c
 typedef struct hbs_options {
-    json_object *hash;                   // Hash arguments (key=value pairs)
-    json_object *data;                   // Private data (@index, @key, etc.)
-    json_object *context;                // Current context object
-    json_object **params;                // Resolved positional parameters
+    json_object *hash;                              // Hash arguments (key=value pairs)
+    json_object *data;                              // Private data (@index, @key, etc.)
+    json_object *context;                           // Current context object
+    json_object **params;                           // Resolved positional parameters
     int param_count;
-    char *(*fn)(json_object *ctx);       // Render block body with context
-    char *(*inverse)(json_object *ctx);  // Render else block with context
-    void *_internal;                     // Internal (do not use)
+    const char *name;                               // Name of the helper being invoked
+    char **block_params;                            // Block parameter names (as |x y|)
+    int block_param_count;
+    char *(*fn)(json_object *ctx, void *data);      // Render block body with context
+    char *(*inverse)(json_object *ctx, void *data); // Render else block with context
+    void *fn_data;                                  // Closure data for fn (pass to fn)
+    void *inverse_data;                             // Closure data for inverse (pass to inverse)
+    void *_internal;                                // Internal (do not use)
 } hbs_options_t;
 ```
 
@@ -154,7 +180,7 @@ hbs_register_helper(env, "bold", helper_bold);
 ```c
 static char *helper_noop(json_object **params, int param_count, hbs_options_t *options) {
     if (options->fn) {
-        return options->fn(options->context);
+        return options->fn(options->context, options->fn_data);
     }
     return strdup("");
 }
@@ -194,9 +220,12 @@ hbs_register_partial(env, "header", "<h1>{{title}}</h1>");
 ### Utilities
 
 ```c
-char *hbs_escape_html(const char *input);    // Caller must free()
+json_object *hbs_create_frame(hbs_options_t *options);  // Create private data frame (caller must json_object_put())
+char *hbs_escape_html(const char *input);               // Caller must free()
 const char *hbs_error_string(hbs_error_t err);
 ```
+
+`hbs_create_frame()` creates a shallow copy of `options->data` for use in custom helpers that need to set private data variables (like `@index`, `@key`).
 
 ### Error Codes
 

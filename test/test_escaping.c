@@ -139,4 +139,33 @@ void test_escaping(void) {
     }
 
     hbs_env_destroy(env);
+
+    /* noEscape: {{expr}} does not escape when noEscape is set */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+        hbs_env_set_no_escape(env2, true);
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "html", json_object_new_string("<b>bold</b>"));
+
+        char *result = render_template(env2, "{{html}}", ctx);
+        ASSERT_STR_EQ("<b>bold</b>", result, "noEscape: {{}} does not escape HTML");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env2);
+    }
+
+    /* noEscape off: {{expr}} still escapes (default) */
+    {
+        hbs_env_t *env2 = hbs_env_create();
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "html", json_object_new_string("<b>bold</b>"));
+
+        char *result = render_template(env2, "{{html}}", ctx);
+        ASSERT_STR_EQ("&lt;b&gt;bold&lt;/b&gt;", result, "noEscape off: {{}} still escapes");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env2);
+    }
 }
