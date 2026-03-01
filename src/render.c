@@ -6,6 +6,20 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Portable strndup for systems that lack it (e.g. Windows/MinGW) */
+#if defined(_WIN32) || defined(__MINGW32__)
+static char *portable_strndup(const char *s, size_t n) {
+    size_t len = strnlen(s, n);
+    char *dup = (char *)malloc(len + 1);
+    if (dup) {
+        memcpy(dup, s, len);
+        dup[len] = '\0';
+    }
+    return dup;
+}
+#define strndup portable_strndup
+#endif
+
 /* ---- Environment struct ---- */
 
 struct hbs_env {
