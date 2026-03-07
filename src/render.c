@@ -444,30 +444,7 @@ static char *render_program_to_string(hbs_render_state_t *state, hbs_ast_node_t 
     return hbs_strbuf_detach(&sub.output);
 }
 
-/* ---- Whitespace stripping ---- */
 
-static void strip_trailing_whitespace(hbs_strbuf_t *buf) {
-    while (buf->len > 0 && (buf->data[buf->len - 1] == ' ' ||
-           buf->data[buf->len - 1] == '\t' ||
-           buf->data[buf->len - 1] == '\n' ||
-           buf->data[buf->len - 1] == '\r')) {
-        buf->len--;
-    }
-    buf->data[buf->len] = '\0';
-}
-
-static void strip_leading_whitespace_from_text(char *text) {
-    if (!text) return;
-    size_t i = 0;
-    size_t len = strlen(text);
-    while (i < len && (text[i] == ' ' || text[i] == '\t' ||
-           text[i] == '\n' || text[i] == '\r')) {
-        i++;
-    }
-    if (i > 0) {
-        memmove(text, text + i, len - i + 1);
-    }
-}
 
 /* ---- Built-in helpers ---- */
 
@@ -1004,47 +981,7 @@ static void render_program(hbs_render_state_t *state, hbs_ast_node_t *program) {
 
     for (int i = 0; i < program->program.statement_count; i++) {
         if (state->has_error) return;
-        hbs_ast_node_t *stmt = program->program.statements[i];
-
-        /* Apply whitespace stripping from previous mustache/block */
-        if (i > 0 && stmt->type == HBS_AST_TEXT) {
-            hbs_ast_node_t *prev = program->program.statements[i - 1];
-            bool should_strip = false;
-            if (prev->type == HBS_AST_MUSTACHE && prev->mustache.strip_right) {
-                should_strip = true;
-            } else if (prev->type == HBS_AST_BLOCK) {
-                if (prev->block.strip_open_right && i == 1) {
-                    should_strip = true;
-                }
-            }
-            if (should_strip) {
-                /* Strip leading whitespace from this text node */
-                char *copy = strdup(stmt->text.value);
-                strip_leading_whitespace_from_text(copy);
-                hbs_strbuf_append(&state->output, copy);
-                free(copy);
-                continue;
-            }
-        }
-
-        /* Check if next node wants to strip trailing whitespace */
-        if (stmt->type == HBS_AST_TEXT && i + 1 < program->program.statement_count) {
-            hbs_ast_node_t *next = program->program.statements[i + 1];
-            bool should_strip = false;
-            if (next->type == HBS_AST_MUSTACHE && next->mustache.strip_left) {
-                should_strip = true;
-            } else if (next->type == HBS_AST_BLOCK && next->block.strip_open_left) {
-                should_strip = true;
-            }
-            if (should_strip) {
-                /* Append text but strip trailing whitespace */
-                hbs_strbuf_append(&state->output, stmt->text.value);
-                strip_trailing_whitespace(&state->output);
-                continue;
-            }
-        }
-
-        render_node(state, stmt);
+        render_node(state, program->program.statements[i]);
     }
 }
 
@@ -1177,6 +1114,7 @@ static void render_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
                     }
                 }
             }
+
             break;
         }
 
@@ -1531,6 +1469,118 @@ static void standalone_strip(hbs_ast_node_t *program) {
     }
 }
 
+/* ---- Tilde (~) whitespace control AST pass ---- */
+
+/*
+ * Strip leading whitespace (including newlines) from a text node's value.
+ */
+static void ast_strip_text_leading(hbs_ast_node_t *text_node) {
+    if (!text_node || text_node->type != HBS_AST_TEXT || !text_node->text.value) return;
+    char *val = text_node->text.value;
+    size_t len = strlen(val);
+    size_t start = 0;
+    while (start < len && (val[start] == ' ' || val[start] == '\t' ||
+                           val[start] == '\n' || val[start] == '\r')) {
+        start++;
+    }
+    if (start > 0) {
+        memmove(val, val + start, len - start + 1);
+    }
+}
+
+/*
+ * Strip trailing whitespace (including newlines) from a text node's value.
+ */
+static void ast_strip_text_trailing(hbs_ast_node_t *text_node) {
+    if (!text_node || text_node->type != HBS_AST_TEXT || !text_node->text.value) return;
+    char *val = text_node->text.value;
+    size_t len = strlen(val);
+    while (len > 0 && (val[len - 1] == ' ' || val[len - 1] == '\t' ||
+                       val[len - 1] == '\n' || val[len - 1] == '\r')) {
+        len--;
+    }
+    val[len] = '\0';
+}
+
+/*
+ * Get the first text node in a program, or NULL.
+ */
+static hbs_ast_node_t *first_text_of(hbs_ast_node_t *program) {
+    if (!program || program->type != HBS_AST_PROGRAM) return NULL;
+    if (program->program.statement_count > 0 &&
+        program->program.statements[0]->type == HBS_AST_TEXT) {
+        return program->program.statements[0];
+    }
+    return NULL;
+}
+
+/*
+ * Get the last text node in a program, or NULL.
+ */
+static hbs_ast_node_t *last_text_of(hbs_ast_node_t *program) {
+    if (!program || program->type != HBS_AST_PROGRAM) return NULL;
+    int c = program->program.statement_count;
+    if (c > 0 && program->program.statements[c - 1]->type == HBS_AST_TEXT) {
+        return program->program.statements[c - 1];
+    }
+    return NULL;
+}
+
+/*
+ * Post-parse AST pass: apply tilde (~) whitespace control flags.
+ * This modifies text nodes adjacent to blocks/mustaches with strip flags set.
+ * Runs AFTER standalone_strip so it handles remaining tilde-based stripping.
+ */
+static void tilde_strip(hbs_ast_node_t *program) {
+    if (!program || program->type != HBS_AST_PROGRAM) return;
+
+    int count = program->program.statement_count;
+    hbs_ast_node_t **stmts = program->program.statements;
+
+    for (int i = 0; i < count; i++) {
+        hbs_ast_node_t *node = stmts[i];
+
+        if (node->type == HBS_AST_BLOCK) {
+            /* strip_open_left: strip trailing ws from prev text in outer program */
+            if (node->block.strip_open_left && i > 0 && stmts[i - 1]->type == HBS_AST_TEXT) {
+                ast_strip_text_trailing(stmts[i - 1]);
+            }
+
+            /* strip_open_right: strip leading ws from first text in body */
+            if (node->block.strip_open_right) {
+                ast_strip_text_leading(first_text_of(node->block.body));
+            }
+
+            /* strip_close_left: strip trailing ws from last text in body/inverse */
+            if (node->block.strip_close_left) {
+                hbs_ast_node_t *last_body = node->block.inverse ? node->block.inverse : node->block.body;
+                ast_strip_text_trailing(last_text_of(last_body));
+            }
+
+            /* strip_close_right: strip leading ws from next text in outer program */
+            if (node->block.strip_close_right && i + 1 < count && stmts[i + 1]->type == HBS_AST_TEXT) {
+                ast_strip_text_leading(stmts[i + 1]);
+            }
+
+            /* Recurse into body and inverse */
+            tilde_strip(node->block.body);
+            tilde_strip(node->block.inverse);
+        }
+
+        if (node->type == HBS_AST_MUSTACHE) {
+            /* strip_left: strip trailing ws from prev text */
+            if (node->mustache.strip_left && i > 0 && stmts[i - 1]->type == HBS_AST_TEXT) {
+                ast_strip_text_trailing(stmts[i - 1]);
+            }
+
+            /* strip_right: strip leading ws from next text */
+            if (node->mustache.strip_right && i + 1 < count && stmts[i + 1]->type == HBS_AST_TEXT) {
+                ast_strip_text_leading(stmts[i + 1]);
+            }
+        }
+    }
+}
+
 /* ---- Public API implementation ---- */
 
 hbs_env_t *hbs_env_create(void) {
@@ -1641,6 +1691,9 @@ hbs_template_t *hbs_compile(hbs_env_t *env, const char *source, hbs_error_t *err
 
     /* Post-parse: strip standalone whitespace lines */
     standalone_strip(ast);
+
+    /* Post-parse: apply tilde (~) whitespace control */
+    tilde_strip(ast);
 
     hbs_template_t *tmpl = calloc(1, sizeof(hbs_template_t));
     tmpl->ast = ast;

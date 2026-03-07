@@ -11,6 +11,7 @@ void test_helpers(void);
 void test_escaping(void);
 void test_partials(void);
 void test_blocks(void);
+void test_whitespace(void);
 
 int main(void) {
     printf("Sindarin Template Engine - Test Suite\n");
@@ -21,6 +22,7 @@ int main(void) {
     test_escaping();
     test_partials();
     test_blocks();
+    test_whitespace();
 
     TEST_SUMMARY();
 

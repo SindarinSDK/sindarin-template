@@ -433,6 +433,13 @@ int hbs_lexer_tokenize(hbs_lexer_t *lex) {
                 int line = lex->line, col = lex->col;
                 lex->pos += 2; lex->col += 2;
 
+                /* Check for leading tilde: {{~ before tag type char */
+                bool has_open_strip = false;
+                if (lex->pos < lex->len && lex->source[lex->pos] == '~') {
+                    has_open_strip = true;
+                    advance(lex);
+                }
+
                 char next = lex->pos < lex->len ? lex->source[lex->pos] : '\0';
                 char next2 = (lex->pos + 1) < lex->len ? lex->source[lex->pos + 1] : '\0';
 
@@ -457,6 +464,10 @@ int hbs_lexer_tokenize(hbs_lexer_t *lex) {
                     add_token(lex, HBS_TOK_OPEN_COMMENT, NULL, line, col);
                     advance(lex);
                     lex->in_tag = true;
+                    /* Emit strip token before comment body if tilde was present */
+                    if (has_open_strip) {
+                        add_token(lex, HBS_TOK_STRIP, NULL, line, col);
+                    }
                     lex_comment(lex);
                     continue;
                 } else if (next == '^') {
@@ -467,6 +478,11 @@ int hbs_lexer_tokenize(hbs_lexer_t *lex) {
                     advance(lex);
                 } else {
                     add_token(lex, HBS_TOK_OPEN, NULL, line, col);
+                }
+
+                /* Emit strip token after open token if tilde was present */
+                if (has_open_strip && next != '!') {
+                    add_token(lex, HBS_TOK_STRIP, NULL, line, col);
                 }
 
                 lex->in_tag = true;
