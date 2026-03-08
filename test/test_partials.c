@@ -186,6 +186,89 @@ void test_partials(void) {
         hbs_env_destroy(env);
     }
 
+    /* Parent context access: ../ inside partial called from #each */
+    {
+        hbs_env_t *env = hbs_env_create();
+        hbs_register_partial(env, "item_p", "{{../name}}:{{this}}");
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "name", json_object_new_string("PARENT"));
+        json_object *items = json_object_new_array();
+        json_object_array_add(items, json_object_new_string("a"));
+        json_object_array_add(items, json_object_new_string("b"));
+        json_object_object_add(ctx, "items", items);
+
+        char *result = render_template(env,
+            "{{#each items}}[{{> item_p}}]{{/each}}", ctx);
+        ASSERT_STR_EQ("[PARENT:a][PARENT:b]", result,
+            "../ inside partial accesses each-parent context");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env);
+    }
+
+    /* @root inside partial called from #each */
+    {
+        hbs_env_t *env = hbs_env_create();
+        hbs_register_partial(env, "root_p", "{{@root.name}}:{{this}}");
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "name", json_object_new_string("ROOT"));
+        json_object *items = json_object_new_array();
+        json_object_array_add(items, json_object_new_string("x"));
+        json_object_object_add(ctx, "items", items);
+
+        char *result = render_template(env,
+            "{{#each items}}[{{> root_p}}]{{/each}}", ctx);
+        ASSERT_STR_EQ("[ROOT:x]", result,
+            "@root inside partial accesses root context");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env);
+    }
+
+    /* ../ through multiple partial boundaries (partial calls partial) */
+    {
+        hbs_env_t *env = hbs_env_create();
+        hbs_register_partial(env, "inner_p", "{{../../name}}:{{this}}");
+        hbs_register_partial(env, "outer_p", "{{> inner_p}}");
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "name", json_object_new_string("TOP"));
+        json_object *items = json_object_new_array();
+        json_object_array_add(items, json_object_new_string("v"));
+        json_object_object_add(ctx, "items", items);
+
+        char *result = render_template(env,
+            "{{#each items}}{{> outer_p}}{{/each}}", ctx);
+        ASSERT_STR_EQ("TOP:v", result,
+            "../../ through nested partials accesses grandparent context");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env);
+    }
+
+    /* @root through multiple partial boundaries */
+    {
+        hbs_env_t *env = hbs_env_create();
+        hbs_register_partial(env, "deep_root", "{{@root.title}}");
+        hbs_register_partial(env, "mid_p", "{{> deep_root}}");
+
+        json_object *ctx = json_object_new_object();
+        json_object_object_add(ctx, "title", json_object_new_string("TITLE"));
+        json_object *items = json_object_new_array();
+        json_object_array_add(items, json_object_new_string("z"));
+        json_object_object_add(ctx, "items", items);
+
+        char *result = render_template(env,
+            "{{#each items}}{{> mid_p}}{{/each}}", ctx);
+        ASSERT_STR_EQ("TITLE", result,
+            "@root through nested partials accesses root context");
+        free(result);
+        json_object_put(ctx);
+        hbs_env_destroy(env);
+    }
+
     /* hbs_unregister_partial */
     {
         hbs_env_t *env = hbs_env_create();

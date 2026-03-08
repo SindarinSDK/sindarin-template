@@ -873,33 +873,51 @@ static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
         hbs_template_t *ptmpl = hbs_compile(state->env, source, &err);
         if (!ptmpl) return;
 
-        /* Create a frame for the partial with optional hash params */
-        hbs_context_frame_t *child = frame_push(state->frame, partial_ctx);
+        /* Only push a new frame when a custom context or hash params are
+         * provided.  Otherwise render in the caller's frame so that ../
+         * depth is consistent with Handlebars.js (partials don't add a
+         * scope level by themselves). */
+        hbs_context_frame_t *child = NULL;
+        bool needs_frame = node->partial.context || node->partial.hash_count > 0;
 
-        if (node->partial.hash_count > 0) {
-            json_object *extended;
-            if (json_object_is_type(partial_ctx, json_type_object)) {
-                extended = json_object_new_object();
-                json_object_object_foreach(partial_ctx, key, val) {
-                    json_object_object_add(extended, key, json_object_get(val));
+        if (needs_frame) {
+            child = frame_push(state->frame, partial_ctx);
+
+            if (node->partial.hash_count > 0) {
+                json_object *extended;
+                if (json_object_is_type(partial_ctx, json_type_object)) {
+                    extended = json_object_new_object();
+                    json_object_object_foreach(partial_ctx, key, val) {
+                        json_object_object_add(extended, key, json_object_get(val));
+                    }
+                } else {
+                    extended = json_object_new_object();
                 }
-            } else {
-                extended = json_object_new_object();
-            }
-            for (int i = 0; i < node->partial.hash_count; i++) {
-                json_object *hv = evaluate_node(state, node->partial.hash_pairs[i].value);
-                if (hv) {
-                    json_object_object_add(extended, node->partial.hash_pairs[i].key,
-                        json_object_get(hv));
+                for (int i = 0; i < node->partial.hash_count; i++) {
+                    json_object *hv = evaluate_node(state, node->partial.hash_pairs[i].value);
+                    if (hv) {
+                        json_object_object_add(extended, node->partial.hash_pairs[i].key,
+                            json_object_get(hv));
+                    }
                 }
+                child->data = extended;
             }
-            child->data = extended;
+
+            state->frame = child;
         }
 
-        state->frame = child;
-        hbs_error_t rerr;
-        result = hbs_render(ptmpl, child->data, &rerr);
-        state->frame = frame_pop(child);
+        /* Render the partial's AST using the current state so that the parent
+         * frame chain is preserved.  This allows ../ and @root to traverse
+         * back through partial boundaries, matching Handlebars.js behaviour. */
+        hbs_strbuf_t saved_output = state->output;
+        hbs_strbuf_init(&state->output);
+        render_program(state, ptmpl->ast);
+        result = hbs_strbuf_detach(&state->output);
+        state->output = saved_output;
+
+        if (needs_frame) {
+            state->frame = frame_pop(child);
+        }
         hbs_template_destroy(ptmpl);
     }
 
