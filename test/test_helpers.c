@@ -48,6 +48,7 @@ static char *helper_list(json_object **params, int param_count, hbs_options_t *o
                 pos += 4;
                 memcpy(buf + pos, rendered, rlen);
                 pos += rlen;
+                buf[pos] = '\0';
                 strcat(buf + pos, "</li>");
                 pos += 5;
                 free(rendered);
