@@ -16,10 +16,10 @@ deps:
 
 build: deps
 	cmake -S . -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	cmake --build $(BUILD_DIR)
+	cmake --build $(BUILD_DIR) --config Debug
 
 test: build
-	cd $(BUILD_DIR) && ctest --output-on-failure
+	cd $(BUILD_DIR) && ctest -C Debug --output-on-failure
 
 clean:
 	rm -rf $(BUILD_DIR)
