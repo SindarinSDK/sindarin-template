@@ -1,0 +1,24 @@
+# Build directories
+build/
+vcpkg_installed/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Claude Code
+.claude/
+.mcp.json
