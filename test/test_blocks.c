@@ -175,12 +175,14 @@ void test_blocks(void) {
 
     /* Standalone block: open/close on own lines */
     {
+        json_object *ctx = json_object_new_object();
         char *result = render_template(env,
             "begin\n{{#if true}}\ncontent\n{{/if}}\nend",
-            json_object_new_object());
+            ctx);
         ASSERT_STR_EQ("begin\ncontent\nend", result,
             "standalone block strips open/close lines");
         free(result);
+        json_object_put(ctx);
     }
 
     /* Standalone comment on own line */
