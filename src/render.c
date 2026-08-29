@@ -56,8 +56,7 @@ static hbs_context_frame_t *frame_push(hbs_context_frame_t *parent, json_object 
     return frame;
 }
 
-static hbs_context_frame_t *frame_pop(hbs_context_frame_t *frame) {
-    hbs_context_frame_t *parent = frame->parent;
+static void frame_cleanup(hbs_context_frame_t *frame) {
     if (frame->owns_private_data && frame->private_data) {
         json_object_put(frame->private_data);
     }
@@ -80,6 +79,12 @@ static hbs_context_frame_t *frame_pop(hbs_context_frame_t *frame) {
         free(ip);
         ip = next;
     }
+    frame->inline_partials = NULL;
+}
+
+static hbs_context_frame_t *frame_pop(hbs_context_frame_t *frame) {
+    hbs_context_frame_t *parent = frame->parent;
+    frame_cleanup(frame);
     free(frame);
     return parent;
 }
@@ -223,13 +228,16 @@ static json_object *resolve_path(hbs_render_state_t *state, hbs_path_t *path) {
     return cur;
 }
 
-/* Evaluate an AST node to a json_object value */
+/* Evaluate an AST node to an owned json_object reference. */
 static json_object *evaluate_node(hbs_render_state_t *state, hbs_ast_node_t *node) {
     if (!node) return NULL;
 
     switch (node->type) {
         case HBS_AST_MUSTACHE:
-            return resolve_path(state, node->mustache.path);
+        {
+            json_object *value = resolve_path(state, node->mustache.path);
+            return value ? json_object_get(value) : NULL;
+        }
 
         case HBS_AST_LITERAL:
             switch (node->literal.lit_type) {
@@ -262,7 +270,6 @@ static json_object *evaluate_node(hbs_render_state_t *state, hbs_ast_node_t *nod
                 if (strcmp(helper_name, "lookup") == 0 && node->subexpr.param_count >= 2) {
                     json_object *obj = evaluate_node(state, node->subexpr.params[0]);
                     json_object *key = evaluate_node(state, node->subexpr.params[1]);
-                    bool key_owned = (node->subexpr.params[1]->type == HBS_AST_LITERAL);
 
                     json_object *result = NULL;
                     if (obj && key) {
@@ -274,9 +281,9 @@ static json_object *evaluate_node(hbs_render_state_t *state, hbs_ast_node_t *nod
                             json_object_object_get_ex(obj, key_str, &result);
                         }
                     }
-                    if (key_owned && key) json_object_put(key);
-                    bool obj_owned = (node->subexpr.params[0]->type == HBS_AST_LITERAL);
-                    if (obj_owned && obj) json_object_put(obj);
+                    if (result) json_object_get(result);
+                    if (key) json_object_put(key);
+                    if (obj) json_object_put(obj);
                     return result;
                 }
 
@@ -286,13 +293,10 @@ static json_object *evaluate_node(hbs_render_state_t *state, hbs_ast_node_t *nod
                         if (strcmp(state->env->helpers[i].name, helper_name) == 0) {
                             /* Resolve params */
                             json_object **params = NULL;
-                            bool *param_owned = NULL;
                             if (node->subexpr.param_count > 0) {
                                 params = malloc(sizeof(json_object *) * node->subexpr.param_count);
-                                param_owned = malloc(sizeof(bool) * node->subexpr.param_count);
                                 for (int j = 0; j < node->subexpr.param_count; j++) {
                                     params[j] = evaluate_node(state, node->subexpr.params[j]);
-                                    param_owned[j] = (node->subexpr.params[j]->type == HBS_AST_LITERAL);
                                 }
                             }
 
@@ -303,8 +307,8 @@ static json_object *evaluate_node(hbs_render_state_t *state, hbs_ast_node_t *nod
                                 opts.hash = json_object_new_object();
                                 for (int j = 0; j < node->subexpr.hash_count; j++) {
                                     json_object *hv = evaluate_node(state, node->subexpr.hash_pairs[j].value);
-                                    json_object_object_add(opts.hash, node->subexpr.hash_pairs[j].key,
-                                        hv ? json_object_get(hv) : NULL);
+                                    json_object_object_add(opts.hash,
+                                        node->subexpr.hash_pairs[j].key, hv);
                                 }
                             }
 
@@ -315,10 +319,9 @@ static json_object *evaluate_node(hbs_render_state_t *state, hbs_ast_node_t *nod
                             if (opts.hash) json_object_put(opts.hash);
                             if (params) {
                                 for (int j = 0; j < node->subexpr.param_count; j++) {
-                                    if (param_owned[j] && params[j]) json_object_put(params[j]);
+                                    if (params[j]) json_object_put(params[j]);
                                 }
                                 free(params);
-                                free(param_owned);
                             }
                             return result;
                         }
@@ -441,7 +444,9 @@ static char *render_program_to_string(hbs_render_state_t *state, hbs_ast_node_t 
     sub.frame = &frame;
 
     render_program(&sub, program);
-    return hbs_strbuf_detach(&sub.output);
+    char *result = hbs_strbuf_detach(&sub.output);
+    frame_cleanup(&frame);
+    return result;
 }
 
 
@@ -450,12 +455,9 @@ static char *render_program_to_string(hbs_render_state_t *state, hbs_ast_node_t 
 
 static void render_builtin_if(hbs_render_state_t *state, hbs_ast_node_t *node, bool invert) {
     json_object *condition = NULL;
-    bool condition_owned = false;
 
     if (node->block.param_count > 0) {
         condition = evaluate_node(state, node->block.params[0]);
-        condition_owned = (node->block.params[0]->type == HBS_AST_LITERAL ||
-                          node->block.params[0]->type == HBS_AST_SUBEXPR);
     }
 
     /* Check includeZero hash option */
@@ -466,9 +468,7 @@ static void render_builtin_if(hbs_render_state_t *state, hbs_ast_node_t *node, b
             if (val && json_object_get_boolean(val)) {
                 include_zero = true;
             }
-            if (node->block.hash_pairs[i].value->type == HBS_AST_LITERAL && val) {
-                json_object_put(val);
-            }
+            if (val) json_object_put(val);
         }
     }
 
@@ -488,7 +488,7 @@ static void render_builtin_if(hbs_render_state_t *state, hbs_ast_node_t *node, b
         render_program(state, node->block.inverse);
     }
 
-    if (condition_owned && condition) json_object_put(condition);
+    if (condition) json_object_put(condition);
 }
 
 static void render_builtin_each(hbs_render_state_t *state, hbs_ast_node_t *node) {
@@ -502,6 +502,7 @@ static void render_builtin_each(hbs_render_state_t *state, hbs_ast_node_t *node)
         if (node->block.inverse) {
             render_program(state, node->block.inverse);
         }
+        if (collection) json_object_put(collection);
         return;
     }
 
@@ -509,6 +510,7 @@ static void render_builtin_each(hbs_render_state_t *state, hbs_ast_node_t *node)
         int len = json_object_array_length(collection);
         if (len == 0) {
             if (node->block.inverse) render_program(state, node->block.inverse);
+            json_object_put(collection);
             return;
         }
 
@@ -547,6 +549,7 @@ static void render_builtin_each(hbs_render_state_t *state, hbs_ast_node_t *node)
         int len = json_object_object_length(collection);
         if (len == 0) {
             if (node->block.inverse) render_program(state, node->block.inverse);
+            json_object_put(collection);
             return;
         }
 
@@ -591,6 +594,7 @@ static void render_builtin_each(hbs_render_state_t *state, hbs_ast_node_t *node)
             idx++;
         }
     }
+    json_object_put(collection);
 }
 
 static void render_builtin_with(hbs_render_state_t *state, hbs_ast_node_t *node) {
@@ -604,6 +608,7 @@ static void render_builtin_with(hbs_render_state_t *state, hbs_ast_node_t *node)
         if (node->block.inverse) {
             render_program(state, node->block.inverse);
         }
+        if (new_ctx) json_object_put(new_ctx);
         return;
     }
 
@@ -622,6 +627,7 @@ static void render_builtin_with(hbs_render_state_t *state, hbs_ast_node_t *node)
     state->frame = child;
     render_program(state, node->block.body);
     state->frame = frame_pop(child);
+    json_object_put(new_ctx);
 }
 
 static void render_builtin_lookup(hbs_render_state_t *state, hbs_ast_node_t *node, bool escaped) {
@@ -629,12 +635,9 @@ static void render_builtin_lookup(hbs_render_state_t *state, hbs_ast_node_t *nod
 
     json_object *obj = evaluate_node(state, node->mustache.params[0]);
     json_object *key = evaluate_node(state, node->mustache.params[1]);
-    bool key_owned = (node->mustache.params[1]->type == HBS_AST_LITERAL);
-    bool obj_owned = (node->mustache.params[0]->type == HBS_AST_LITERAL);
 
     if (!obj) {
-        if (key_owned && key) json_object_put(key);
-        if (obj_owned && obj) json_object_put(obj);
+        if (key) json_object_put(key);
         return;
     }
 
@@ -659,17 +662,20 @@ static void render_builtin_lookup(hbs_render_state_t *state, hbs_ast_node_t *nod
         }
     }
 
-    if (key_owned && key) json_object_put(key);
-    if (obj_owned && obj) json_object_put(obj);
+    if (key) json_object_put(key);
+    json_object_put(obj);
 }
 
 static void render_builtin_log(hbs_render_state_t *state, hbs_ast_node_t *node) {
     /* Determine log level from hash */
     const char *level = "info";
+    json_object *level_value = NULL;
     for (int i = 0; i < node->mustache.hash_count; i++) {
         if (strcmp(node->mustache.hash_pairs[i].key, "level") == 0) {
             json_object *lv = evaluate_node(state, node->mustache.hash_pairs[i].value);
             if (lv) {
+                if (level_value) json_object_put(level_value);
+                level_value = lv;
                 level = json_object_get_string(lv);
             }
         }
@@ -677,10 +683,10 @@ static void render_builtin_log(hbs_render_state_t *state, hbs_ast_node_t *node) 
 
     for (int i = 0; i < node->mustache.param_count; i++) {
         json_object *val = evaluate_node(state, node->mustache.params[i]);
-        bool owned = (node->mustache.params[i]->type == HBS_AST_LITERAL);
         fprintf(stderr, "[%s] %s\n", level, json_value_to_string(val));
-        if (owned && val) json_object_put(val);
+        if (val) json_object_put(val);
     }
+    if (level_value) json_object_put(level_value);
 }
 
 /* ---- Custom helper invocation ---- */
@@ -717,14 +723,10 @@ static void render_custom_helper(hbs_render_state_t *state, const char *name,
                                   char **block_params, int block_param_count) {
     /* Resolve params */
     json_object **params = NULL;
-    bool *param_owned = NULL;
     if (param_count > 0) {
         params = malloc(sizeof(json_object *) * param_count);
-        param_owned = malloc(sizeof(bool) * param_count);
         for (int i = 0; i < param_count; i++) {
             params[i] = evaluate_node(state, param_nodes[i]);
-            param_owned[i] = (param_nodes[i]->type == HBS_AST_LITERAL ||
-                             param_nodes[i]->type == HBS_AST_SUBEXPR);
         }
     }
 
@@ -743,9 +745,7 @@ static void render_custom_helper(hbs_render_state_t *state, const char *name,
         opts.hash = json_object_new_object();
         for (int i = 0; i < hash_count; i++) {
             json_object *hv = evaluate_node(state, hash_pairs[i].value);
-            if (hv) {
-                json_object_object_add(opts.hash, hash_pairs[i].key, json_object_get(hv));
-            }
+            json_object_object_add(opts.hash, hash_pairs[i].key, hv);
         }
     }
 
@@ -780,10 +780,9 @@ static void render_custom_helper(hbs_render_state_t *state, const char *name,
     if (opts.hash) json_object_put(opts.hash);
     if (params) {
         for (int i = 0; i < param_count; i++) {
-            if (param_owned[i] && params[i]) json_object_put(params[i]);
+            if (params[i]) json_object_put(params[i]);
         }
         free(params);
-        free(param_owned);
     }
 }
 
@@ -791,18 +790,22 @@ static void render_custom_helper(hbs_render_state_t *state, const char *name,
 
 static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
     const char *pname = NULL;
+    char *dynamic_pname = NULL;
+    json_object *owned_partial_ctx = NULL;
 
     /* Dynamic partial: evaluate subexpression to get name */
     if (node->partial.dynamic_name) {
         json_object *name_val = evaluate_node(state, node->partial.dynamic_name);
         if (name_val) {
-            pname = json_object_get_string(name_val);
+            dynamic_pname = strdup(json_object_get_string(name_val));
+            pname = dynamic_pname;
+            json_object_put(name_val);
         }
     } else if (node->partial.name && node->partial.name->part_count > 0) {
         pname = node->partial.name->parts[0];
     }
 
-    if (!pname) return;
+    if (!pname) goto cleanup;
 
     /* Special case: {{> @partial-block}} — yield to the caller's block content */
     if (strcmp(pname, "@partial-block") == 0) {
@@ -816,18 +819,21 @@ static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
                 state->frame = child;
                 render_program(state, search->partial_block);
                 state->frame = frame_pop(child);
-                return;
+                goto cleanup;
             }
             search = search->parent;
         }
-        return;
+        goto cleanup;
     }
 
     /* Determine context for the partial */
     json_object *partial_ctx = state->frame->data;
     if (node->partial.context) {
         json_object *ctx_val = evaluate_node(state, node->partial.context);
-        if (ctx_val) partial_ctx = ctx_val;
+        if (ctx_val) {
+            partial_ctx = ctx_val;
+            owned_partial_ctx = ctx_val;
+        }
     }
 
     char *result = NULL;
@@ -836,19 +842,19 @@ static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
     hbs_ast_node_t *inline_body = find_inline_partial(state, pname);
     if (inline_body) {
         hbs_context_frame_t *child = frame_push(state->frame, partial_ctx);
+        json_object *extended = NULL;
 
         /* Add hash params to context */
         if (node->partial.hash_count > 0) {
-            json_object *extended = json_object_get(partial_ctx);
-            if (!json_object_is_type(extended, json_type_object)) {
-                extended = json_object_new_object();
+            extended = json_object_new_object();
+            if (json_object_is_type(partial_ctx, json_type_object)) {
+                json_object_object_foreach(partial_ctx, key, val) {
+                    json_object_object_add(extended, key, json_object_get(val));
+                }
             }
             for (int i = 0; i < node->partial.hash_count; i++) {
                 json_object *hv = evaluate_node(state, node->partial.hash_pairs[i].value);
-                if (hv) {
-                    json_object_object_add(extended, node->partial.hash_pairs[i].key,
-                        json_object_get(hv));
-                }
+                json_object_object_add(extended, node->partial.hash_pairs[i].key, hv);
             }
             child->data = extended;
         }
@@ -856,9 +862,10 @@ static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
         state->frame = child;
         result = render_program_to_string(state, inline_body, child->data);
         state->frame = frame_pop(child);
+        if (extended) json_object_put(extended);
     } else {
         /* Find registered partial */
-        if (!state->env) return;
+        if (!state->env) goto cleanup;
         const char *source = NULL;
         for (int i = 0; i < state->env->partial_count; i++) {
             if (strcmp(state->env->partials[i].name, pname) == 0) {
@@ -866,12 +873,12 @@ static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
                 break;
             }
         }
-        if (!source) return;
+        if (!source) goto cleanup;
 
         /* Compile and render the partial */
         hbs_error_t err;
         hbs_template_t *ptmpl = hbs_compile(state->env, source, &err);
-        if (!ptmpl) return;
+        if (!ptmpl) goto cleanup;
 
         /* Only push a new frame when a custom context or hash params are
          * provided.  Otherwise render in the caller's frame so that ../
@@ -879,28 +886,26 @@ static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
          * scope level by themselves). */
         hbs_context_frame_t *child = NULL;
         bool needs_frame = node->partial.context || node->partial.hash_count > 0;
+        json_object *extended_context = NULL;
 
         if (needs_frame) {
             child = frame_push(state->frame, partial_ctx);
 
             if (node->partial.hash_count > 0) {
-                json_object *extended;
                 if (json_object_is_type(partial_ctx, json_type_object)) {
-                    extended = json_object_new_object();
+                    extended_context = json_object_new_object();
                     json_object_object_foreach(partial_ctx, key, val) {
-                        json_object_object_add(extended, key, json_object_get(val));
+                        json_object_object_add(extended_context, key, json_object_get(val));
                     }
                 } else {
-                    extended = json_object_new_object();
+                    extended_context = json_object_new_object();
                 }
                 for (int i = 0; i < node->partial.hash_count; i++) {
                     json_object *hv = evaluate_node(state, node->partial.hash_pairs[i].value);
-                    if (hv) {
-                        json_object_object_add(extended, node->partial.hash_pairs[i].key,
-                            json_object_get(hv));
-                    }
+                    json_object_object_add(extended_context,
+                        node->partial.hash_pairs[i].key, hv);
                 }
-                child->data = extended;
+                child->data = extended_context;
             }
 
             state->frame = child;
@@ -917,6 +922,7 @@ static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
 
         if (needs_frame) {
             state->frame = frame_pop(child);
+            if (extended_context) json_object_put(extended_context);
         }
         hbs_template_destroy(ptmpl);
     }
@@ -941,6 +947,10 @@ static void render_partial(hbs_render_state_t *state, hbs_ast_node_t *node) {
         }
         free(result);
     }
+
+cleanup:
+    if (owned_partial_ctx) json_object_put(owned_partial_ctx);
+    free(dynamic_pname);
 }
 
 /* Render a partial block: {{#> name}}fallback{{/name}} */
@@ -1750,12 +1760,15 @@ char *hbs_render(hbs_template_t *tmpl, json_object *context, hbs_error_t *err) {
         if (err) *err = HBS_ERR_RENDER;
         memcpy(tmpl->last_error, state.error_msg, sizeof(tmpl->last_error));
         hbs_strbuf_free(&state.output);
+        frame_cleanup(&root_frame);
         return NULL;
     }
 
     tmpl->last_error[0] = '\0';
     if (err) *err = HBS_OK;
-    return hbs_strbuf_detach(&state.output);
+    char *result = hbs_strbuf_detach(&state.output);
+    frame_cleanup(&root_frame);
+    return result;
 }
 
 const char *hbs_render_error_message(hbs_template_t *tmpl) {

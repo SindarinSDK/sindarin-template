@@ -10,12 +10,14 @@ void test_whitespace(void) {
 
     /* Standalone #if strips the tag line */
     {
+        json_object *ctx = json_object_new_object();
         char *result = render_template(env,
             "begin\n{{#if true}}\ncontent\n{{/if}}\nend",
-            json_object_new_object());
+            ctx);
         ASSERT_STR_EQ("begin\ncontent\nend", result,
             "standalone #if/#endif strips tag lines");
         free(result);
+        json_object_put(ctx);
     }
 
     /* Standalone #if with else strips all tag lines */
